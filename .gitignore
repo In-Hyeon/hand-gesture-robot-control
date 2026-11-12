@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# hand-teleop
+.venv-ros/
+models/
+.obsidian/
+# ROS 2 colcon
+install/
+log/
