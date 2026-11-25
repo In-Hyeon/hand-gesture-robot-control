@@ -19,13 +19,15 @@ rclpy는 이 파일에서만 import한다. 손 좌표 로직은 tracker.py(순�
 - 손을 놓치면 필터를 초기화한다. 다시 잡힌 첫 프레임은 원본 그대로 나간다.
 - 한 프레임에 max_jump(정규화 단위)보다 멀리 튀면 다른 손으로 넘어간 것으로 보고
   그 프레임을 IDLE로 내고 필터를 초기화한다. 제어부는 IDLE → MOVE에서 기준점을 새로 잡으므로 로봇이 튀지 않는다.
-- 필터 비교용 녹화는 filter:=none으로 원본 좌표를 남긴다.
+- 필터 전 원본 위치는 /hand/raw (geometry_msgs/PointStamped, 같은 stamp·단위, 손이 잡힌 프레임만)로 따로 낸다.
+  필터를 켠 채 rosbag2로 녹화해도 원본이 남는다. 제어에는 쓰지 않는다 (hand_teleop_msgs/README.md).
 """
 import math
 import sys
 import time
 
 import rclpy
+from geometry_msgs.msg import PointStamped
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
@@ -67,6 +69,7 @@ class HandStateNode(Node):
 
         qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=1)
         self.pub = self.create_publisher(HandState, "/hand/state", qos)
+        self.raw_pub = self.create_publisher(PointStamped, "/hand/raw", qos)
 
         self.cap = open_camera(self.cam, self.width, self.height, self.fps_req)
         self.tracker = HandTracker(min_confidence=self.min_conf)
@@ -111,6 +114,10 @@ class HandStateNode(Node):
             msg.handedness = hand.handedness
             msg.confidence = hand.confidence
             msg.mode = HandState.MODE_IDLE if jumped else self.mode_tracking
+            raw = PointStamped()
+            raw.header = msg.header
+            raw.point.x, raw.point.y = hand.x, hand.y
+            self.raw_pub.publish(raw)
         else:
             if self.raw_prev is not None:  # 손을 놓친 첫 프레임: 다시 잡히면 필터를 새로 시작
                 self.filter.reset()
