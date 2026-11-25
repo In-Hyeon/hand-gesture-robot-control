@@ -13,8 +13,15 @@ rclpy는 이 파일에서만 import한다. 손 좌표 로직은 tracker.py(순�
   hand_detected=false(→ IDLE)가 된다. 메시지의 confidence(좌우 판별 점수)는 항상 0.5 이상이라
   그 값과 비교하는 방식으로는 일시정지가 걸리지 않는다.
 - gripper: 항상 OPEN.
-- 필터 없음(x, y = 원본 기준점). 필터 교체는 다음 단계에서 붙인다.
+
+필터: `filter` 파라미터로 none / ma / deadzone / oneeuro 중 선택 (기본 none = 원본 좌표).
+    .venv-ros/bin/python -m hand_teleop.ros_node --ros-args -p filter:=oneeuro -p oneeuro_beta:=10.0
+- 손을 놓치면 필터를 초기화한다. 다시 잡힌 첫 프레임은 원본 그대로 나간다.
+- 한 프레임에 max_jump(정규화 단위)보다 멀리 튀면 다른 손으로 넘어간 것으로 보고
+  그 프레임을 IDLE로 내고 필터를 초기화한다. 제어부는 IDLE → MOVE에서 기준점을 새로 잡으므로 로봇이 튀지 않는다.
+- 필터 비교용 녹화는 filter:=none으로 원본 좌표를 남긴다.
 """
+import math
 import sys
 import time
 
@@ -24,6 +31,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from hand_teleop_msgs.msg import HandState
 from hand_teleop.camera import actual_settings, open_camera
+from hand_teleop.filters import make_filter
 from hand_teleop.tracker import HandTracker
 
 MODES = {"idle": HandState.MODE_IDLE, "move": HandState.MODE_MOVE,
@@ -44,6 +52,19 @@ class HandStateNode(Node):
             raise ValueError(f"mode_when_tracking must be one of {list(MODES)}, got {mode_name!r}")
         self.mode_tracking = MODES[mode_name]
 
+        filter_name = p("filter", "none").value
+        filter_params = {
+            "ma": {"window": p("ma_window", 5).value},
+            "deadzone": {"radius": p("deadzone_radius", 0.003).value},
+            "oneeuro": {"min_cutoff": p("oneeuro_min_cutoff", 1.0).value,
+                        "beta": p("oneeuro_beta", 10.0).value,
+                        "d_cutoff": p("oneeuro_d_cutoff", 1.0).value},
+        }.get(filter_name, {})
+        self.filter = make_filter(filter_name, **filter_params)
+        # 30fps에서 0.1/프레임 = 초당 영상 너비 3배. 정상적인 손 이동보다 훨씬 빠르다
+        self.max_jump = p("max_jump", 0.1).value
+        self.raw_prev: tuple[float, float] | None = None  # 직전 프레임 원본 기준점 (튐 판정용)
+
         qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=1)
         self.pub = self.create_publisher(HandState, "/hand/state", qos)
 
@@ -52,13 +73,13 @@ class HandStateNode(Node):
 
         self.last_x = self.last_y = 0.0  # 손이 없을 때 유지할 마지막 값
         self.t0 = time.perf_counter()
-        self.n = self.seen = self.read_fail = 0
+        self.n = self.seen = self.read_fail = self.jumps = 0
         self.proc_ms_sum = 0.0
         self.win_t, self.win_n, self.win_proc = self.t0, 0, 0.0
         self.get_logger().info(
             f"cam={self.cam} requested {self.width}x{self.height}@{self.fps_req}, "
             f"actual {actual_settings(self.cap)}, min_conf={self.min_conf}, "
-            f"mode_when_tracking={mode_name}, filter=none (v0)")
+            f"mode_when_tracking={mode_name}, filter={filter_name} {filter_params}, max_jump={self.max_jump}")
 
     def step(self) -> bool:
         ok, frame = self.cap.read()
@@ -78,12 +99,22 @@ class HandStateNode(Node):
         msg.header.frame_id = "camera"
         msg.gripper = HandState.GRIPPER_OPEN
         if hand is not None:
-            self.last_x, self.last_y = hand.x, hand.y
+            jumped = (self.raw_prev is not None
+                      and math.hypot(hand.x - self.raw_prev[0], hand.y - self.raw_prev[1]) > self.max_jump)
+            self.raw_prev = (hand.x, hand.y)
+            if jumped:
+                self.jumps += 1
+                self.filter.reset()
+            t = stamp.nanoseconds * 1e-9
+            self.last_x, self.last_y = self.filter.update(t, hand.x, hand.y)
             msg.hand_detected = True
             msg.handedness = hand.handedness
             msg.confidence = hand.confidence
-            msg.mode = self.mode_tracking
+            msg.mode = HandState.MODE_IDLE if jumped else self.mode_tracking
         else:
+            if self.raw_prev is not None:  # 손을 놓친 첫 프레임: 다시 잡히면 필터를 새로 시작
+                self.filter.reset()
+                self.raw_prev = None
             msg.hand_detected = False
             msg.handedness = HandState.HANDEDNESS_UNKNOWN
             msg.confidence = 0.0
@@ -110,7 +141,7 @@ class HandStateNode(Node):
         n = max(self.n, 1)
         return (f"{self.n} frames in {dt:.1f}s = {self.n / dt:.1f} FPS avg, "
                 f"process {self.proc_ms_sum / n:.1f} ms/frame, hand seen {self.seen}/{self.n}, "
-                f"read failures {self.read_fail}")
+                f"read failures {self.read_fail}, jumps {self.jumps}")
 
     def close(self):
         self.cap.release()

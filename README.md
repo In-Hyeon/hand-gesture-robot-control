@@ -22,7 +22,9 @@ hand_teleop_msgs/        /hand/state 메시지 정의 (ROS 2 패키지)
   README.md                인식부·제어부 역할 분담, 좌표 규칙, 모드 전이
 hand_teleop/             인식부 Python 코드
   tracker.py               손 좌표 모듈 (ROS 없는 순수 Python)
-  ros_node.py              인식 노드: 웹캠 → tracker → /hand/state 발행
+  filters.py               떨림 필터: 이동평균, 데드존, One Euro (같은 입력에 바꿔 끼우는 구조)
+  camera.py                웹캠 열기 (노드와 도구가 같은 설정 사용)
+  ros_node.py              인식 노드: 웹캠 → tracker → 필터 → /hand/state 발행
 tools/
   check_env.py             웹캠 + MediaPipe 동작과 FPS 점검
   capture.py               손 기준점 화면 확인, 좌표 CSV 녹화 (ROS 없이)
@@ -55,6 +57,12 @@ models/                  MediaPipe 모델 (설치 스크립트가 받음, git �
 - MediaPipe는 거울 영상을 가정하고 좌우 라벨을 붙인다. 반전하지 않은 영상을 넣으므로 라벨을 뒤집어 실제 손과 맞춘다.
 - 손 좌표와 필터 코어는 ROS 없이 동작하고, `rclpy`는 노드 파일에서만 import한다. ROS 없이도 테스트할 수 있게 하려는 것이다.
 
+**떨림 필터 (`hand_teleop/filters.py`)**
+- 모든 필터가 `update(t, x, y) -> (x, y)`, `reset()` 형태라서 같은 녹화 입력에 바꿔 끼워 비교할 수 있다.
+- `ma`(이동평균): 최근 N프레임 평균. `deadzone`: 반경 안의 움직임은 무시하고, 벗어나면 경계까지만 따라간다(출력이 튀지 않음). `oneeuro`: 느릴 때 강하게, 빠를 때 약하게 거른다(x, y에 같은 차단 주파수를 써서 궤적 모양 유지).
+- 손을 놓치면 필터를 초기화한다. 한 프레임에 `max_jump`보다 멀리 튀면 다른 손으로 넘어간 것으로 보고 그 프레임을 `IDLE`로 낸다(제어부가 기준점을 새로 잡아 로봇이 튀지 않음).
+- 파라미터 기본값은 임시값이다. 녹화 데이터로 비교한 뒤 정한다.
+
 ## 설치와 실행 (Ubuntu 24.04)
 ```bash
 # 1. ROS 2 Jazzy, rosbag2, .venv-ros(rclpy + MediaPipe), 모델 설치
@@ -74,13 +82,28 @@ source install/setup.bash
 ros2 topic echo /hand/state
 ```
 
-노드 파라미터: `cam`(기본 0), `width`·`height`(640×480), `fps`(30), `min_confidence`(0.5), `mode_when_tracking`(idle / move / height / hold).
+노드 파라미터
+| 파라미터 | 기본값 | 뜻 |
+|---|---|---|
+| `cam`, `width`, `height`, `fps` | 0, 640, 480, 30 | 웹캠 번호와 요청 해상도·FPS (실제 적용값은 시작 로그에 출력) |
+| `min_confidence` | 0.5 | MediaPipe 손 검출·존재·추적 임계값. 이보다 낮으면 손 없음(`IDLE`) |
+| `mode_when_tracking` | idle | 손이 보일 때 낼 mode (idle / move / height / hold). 제스처 판별 전 임시 |
+| `filter` | none | none / ma / deadzone / oneeuro. 녹화는 none(원본 좌표)으로 한다 |
+| `ma_window` | 5 | 이동평균 프레임 수 |
+| `deadzone_radius` | 0.003 | 데드존 반경 (정규화 단위) |
+| `oneeuro_min_cutoff`, `oneeuro_beta`, `oneeuro_d_cutoff` | 1.0, 10.0, 1.0 | One Euro 파라미터 |
+| `max_jump` | 0.1 | 한 프레임 최대 이동량 (정규화 단위). 넘으면 그 프레임 `IDLE` + 필터 초기화 |
+
+```bash
+.venv-ros/bin/python -m hand_teleop.ros_node --ros-args -p filter:=oneeuro -p oneeuro_beta:=10.0
+```
 
 ROS 없이 확인할 때:
 ```bash
 .venv-ros/bin/python tools/check_env.py          # 웹캠 + MediaPipe FPS
 .venv-ros/bin/python tools/capture.py            # 손 기준점 화면 확인 (q 종료)
 .venv-ros/bin/python -m hand_teleop.tracker      # tracker 자체 점검 (카메라 불필요)
+.venv-ros/bin/python -m hand_teleop.filters      # 필터 자체 점검: 같은 가상 입력에 필터 4개 적용 (카메라 불필요)
 ```
 
 ## 데이터 규칙
@@ -89,8 +112,8 @@ ROS 없이 확인할 때:
 ## 진행 상황
 | 상태 | 항목 |
 |---|---|
-| 완료 | `/hand/state` 메시지 v0.1, 손 좌표 모듈, 인식 노드 최소 버전 (640×480에서 29.7 FPS, 처리 12.3 ms/프레임, 손 미검출 상태 측정) |
-| 진행 중 | 떨림 필터 3종(이동평균, 데드존, One Euro)과 필터 교체 구조 |
-| 예정 | rosbag2 녹화와 필터 오프라인 비교, 제스처 판별(클러치·높이·그리퍼), 명령 생성 노드, Gazebo 시뮬레이션, OMX-AI 실물 연동 |
+| 완료 | `/hand/state` 메시지 v0.1, 손 좌표 모듈, 인식 노드 (640×480에서 약 29.5 FPS, 처리 12~15 ms/프레임), 떨림 필터 3종과 교체 구조 |
+| 진행 중 | rosbag2 녹화와 필터 오프라인 비교 (정지 떨림 감소율, 교차상관 지연, 5mm 미세 이동 반영률), 파라미터 선정 |
+| 예정 | 제스처 판별(클러치·높이·그리퍼), 명령 생성 노드, Gazebo 시뮬레이션, OMX-AI 실물 연동 |
 
-인식 노드의 `mode`와 `gripper`는 제스처 판별이 붙기 전까지 임시값이고, `x`, `y`에는 아직 필터가 적용되지 않는다.
+인식 노드의 `mode`와 `gripper`는 제스처 판별이 붙기 전까지 임시값이다.
