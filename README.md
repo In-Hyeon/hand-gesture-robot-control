@@ -101,7 +101,7 @@ ros2 topic echo /hand/state
 ROS 없이 확인할 때:
 ```bash
 .venv-ros/bin/python tools/check_env.py          # 웹캠 + MediaPipe FPS
-.venv-ros/bin/python tools/capture.py            # 손 기준점 화면 확인 (q 종료)
+.venv-ros/bin/python tools/capture.py            # 필터 비교 화면: 원본(빨강)과 필터 출력(초록), 1~4로 필터 전환 (q 종료)
 .venv-ros/bin/python -m hand_teleop.tracker      # tracker 자체 점검 (카메라 불필요)
 .venv-ros/bin/python -m hand_teleop.filters      # 필터 자체 점검: 같은 가상 입력에 필터 4개 적용 (카메라 불필요)
 ```

@@ -223,6 +223,8 @@ __marimo__/
 .venv-ros/
 models/
 .obsidian/
+# 녹화 좌표·비교 결과 (팀원 손 데이터, 공개 저장소에 올리지 않음)
+data/
 # ROS 2 colcon
 install/
 log/
