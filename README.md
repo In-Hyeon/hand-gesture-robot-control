@@ -29,6 +29,7 @@ tools/
   check_env.py             웹캠 + MediaPipe 동작과 FPS 점검
   capture.py               필터 비교 화면, 원본 좌표 CSV 녹화 (ROS 없이)
   compare_filters.py       녹화 CSV로 필터·파라미터 오프라인 비교 (떨림 감소율, 지연, 5mm 반영률)
+  mp_smoothing_check.py    MediaPipe VIDEO 모드와 IMAGE 모드의 정지 떨림 비교 (내부 보정 여부 확인)
   setup_ros_jazzy.sh       ROS 2 Jazzy, rosbag2, .venv-ros, MediaPipe 모델 설치
 models/                  MediaPipe 모델 (설치 스크립트가 받음, git 제외)
 ```
@@ -109,17 +110,18 @@ ROS 없이 확인할 때:
 
 ## 필터 비교 (녹화 → 오프라인 비교)
 ```bash
-# 1. 구간별 녹화 (원본 좌표만 저장, 영상 저장 안 함)
-.venv-ros/bin/python tools/capture.py --record data/still.csv --secs 20   # 손을 가만히
-.venv-ros/bin/python tools/capture.py --record data/move.csv  --secs 20   # 좌우·상하로 자연스럽게
-.venv-ros/bin/python tools/capture.py --record data/fine5.csv --secs 30   # 5mm 왕복: 옮기고 1.5초 멈추기 반복
+# 1. 구간별 녹화 (원본 좌표만 저장, 영상 저장 안 함). --guide: 화면 가운데에 동작 안내 (처음 3초는 READY)
+.venv-ros/bin/python tools/capture.py --record data/still.csv --secs 23 --guide still   # 손을 가만히
+.venv-ros/bin/python tools/capture.py --record data/move.csv  --secs 23 --guide move    # 좌우·상하로 자연스럽게
+.venv-ros/bin/python tools/capture.py --record data/fine5.csv --secs 33 --guide fine    # 안내 박자에 맞춰 5mm 왕복
 
 # 2. 비교: 필터·파라미터 조합마다 지표 계산 → data/results/summary.md, all.csv, filters.png
 .venv-ros/bin/python tools/compare_filters.py --still data/still.csv --move data/move.csv --fine data/fine5.csv
 ```
 | 지표 | 계산 | 목표 |
 |---|---|---|
-| 정지 떨림 감소율 | 1초 창마다 2D 표준편차 평균, 원본 대비 | 70% 이상 |
+| 정지 떨림 감소율 | 1초 창마다 2D 표준편차 평균, 원본 대비 (처음 3초 제외) | 70% 이상 |
+| 빠른 떨림 감소율 (보조) | 0.5초 이동평균을 뺀 나머지(≈2Hz 이상)의 RMS, 원본 대비. 느린 손 흔들림을 뺀 잡음 성분 | 참고 |
 | 필터 추가 지연 | 1ms 격자로 보간한 원본·필터 출력의 상호상관이 최대인 시간차 | 50ms 이내 |
 | 5mm 반영률 | 멈춘 구간 사이 이동량을 원본 이동 방향으로 투영한 비율 | 90% 이상 |
 

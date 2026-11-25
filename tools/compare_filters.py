@@ -31,7 +31,7 @@ GRID = {
     "ma": [{"window": w} for w in range(2, 16)],
     "deadzone": [{"radius": r} for r in (0.0005, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.006, 0.008)],
     "oneeuro": [{"min_cutoff": mc, "beta": b} for mc, b in itertools.product(
-        (0.03, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0), (0, 1, 2, 5, 10, 20, 50, 100))],
+        (0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0), (0, 1, 2, 5, 10, 20, 50, 100))],
 }
 
 
@@ -77,9 +77,10 @@ def apply(name, params, t, det, x, y):
 
 
 # ---------------------------------------------------------------- 지표
-def jitter(t, det, x, y, warmup=1.0, win=1.0):
+def jitter(t, det, x, y, warmup=3.0, win=1.0):
     """정지 떨림: 각 연속 구간에서 처음 warmup초를 빼고, win초 창마다 2D 표준편차의 평균.
-    창을 나누는 이유: 20초 동안 손이 천천히 흘러가는(drift) 것은 떨림이 아니므로 빼려는 것."""
+    창을 나누는 이유: 20초 동안 손이 천천히 흘러가는(drift) 것은 떨림이 아니므로 빼려는 것.
+    warmup 3초: 녹화를 시작하고 손을 자리 잡는 움직임을 뺀다 (1초로는 부족했다. 실측 0.58 → 0.34px, 2026-11-26)."""
     stds = []
     for s, e in spans(det):
         i = s
@@ -94,6 +95,25 @@ def jitter(t, det, x, y, warmup=1.0, win=1.0):
                 stds.append(np.sqrt(((px - px.mean()) ** 2 + (py - py.mean()) ** 2).mean()))
             i = j
     return float(np.mean(stds)) if stds else np.nan
+
+
+def jitter_hf(t, det, x, y, warmup=3.0, half=0.25):
+    """빠른 떨림: 앞뒤 half초(합 0.5초) 이동평균을 뺀 나머지의 2D RMS. 대략 2Hz 이상 성분이다.
+    손이 천천히 흔들리는 실제 움직임(1Hz 미만)은 빠지고, 센서·검출 잡음에 가까운 떨림만 남는다.
+    정지 녹화의 94%가 1Hz 미만이었던 실측(2026-11-26) 때문에 추가한 보조 지표."""
+    res = []
+    for s, e in spans(det):
+        tt, xx, yy = t[s:e], x[s:e], y[s:e]
+        keep = tt - tt[0] >= warmup
+        if keep.sum() < 30:
+            continue
+        lo = np.searchsorted(tt, tt - half)
+        hi = np.searchsorted(tt, tt + half, side="right")
+        cx, cy = np.concatenate([[0], np.cumsum(xx)]), np.concatenate([[0], np.cumsum(yy)])
+        n = hi - lo
+        mx, my = (cx[hi] - cx[lo]) / n, (cy[hi] - cy[lo]) / n
+        res.append(((xx - mx) ** 2 + (yy - my) ** 2)[keep])
+    return float(np.sqrt(np.concatenate(res).mean())) if res else np.nan
 
 
 def latency_ms(t, det, x, y, fx, fy, max_ms=300, warmup=0.5):
@@ -184,13 +204,15 @@ def main():
               f"{(len(t) - 1) / (t[-1] - t[0]):.1f} FPS")
 
     raw_jit = jitter(*still)
+    raw_hf = jitter_hf(*still)
     hold_list = holds(*fine, speed_th=args.speed_th)
     # 의도한 이동으로 볼 최소 이동량. hold 위치는 7프레임 이상 평균이라 오차가 프레임 떨림의 약 1/√7(≈0.4배)이므로,
     # 프레임 떨림 1배면 위치 오차의 2.5배 정도다. (처음에 3배로 했다가 5mm 이동이 전부 걸러져서 고침)
     min_step = raw_jit
     _, raw_steps = reflection(*fine, fine[2], fine[3], hold_list, min_step)
     px = args.width
-    print(f"\n원본 정지 떨림: {raw_jit * px:.2f}px" + (f" = {raw_jit * args.mm_per_unit:.2f}mm" if args.mm_per_unit else ""))
+    print(f"\n원본 정지 떨림: {raw_jit * px:.2f}px" + (f" = {raw_jit * args.mm_per_unit:.2f}mm" if args.mm_per_unit else "")
+          + f", 빠른 떨림(≈2Hz 이상): {raw_hf * px:.3f}px")
     print(f"미세 이동: hold {len(hold_list)}개, 비교한 이동 {len(raw_steps)}번, "
           f"원본 이동량 평균 {np.mean(raw_steps) * px if raw_steps else float('nan'):.1f}px "
           f"(5mm 이동이 이 정도 픽셀이어야 함. 너무 다르면 --speed-th 조정)")
@@ -200,7 +222,9 @@ def main():
     rows = []
     for name, grid in GRID.items():
         for params in grid:
-            jit = jitter(still[0], still[1], *apply(name, params, *still))
+            sfx, sfy = apply(name, params, *still)
+            jit = jitter(still[0], still[1], sfx, sfy)
+            hf = jitter_hf(still[0], still[1], sfx, sfy)
             mfx, mfy = apply(name, params, *move)
             lat = latency_ms(*move, mfx, mfy)
             ffx, ffy = apply(name, params, *fine)
@@ -208,31 +232,35 @@ def main():
             red = 1 - jit / raw_jit
             ok = lat <= LAT_MAX_MS and refl >= REFLECT_MIN
             rows.append({"filter": name, "params": params, "reduction": red, "jitter_px": jit * px,
+                         "hf_reduction": 1 - hf / raw_hf,
                          "latency_ms": lat, "reflection": refl, "pass": ok and red >= STILL_MIN, "eligible": ok})
         print(f"  {name}: {len(grid)}개 조합 완료")
 
     with open(args.out / "all.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["filter", "params", "reduction", "jitter_px", "latency_ms", "reflection", "eligible", "meets_all"])
+        w.writerow(["filter", "params", "reduction", "jitter_px", "hf_reduction", "latency_ms", "reflection",
+                    "eligible", "meets_all"])
         for r in rows:
-            w.writerow([r["filter"], r["params"], f"{r['reduction']:.3f}", f"{r['jitter_px']:.3f}",
+            w.writerow([r["filter"], r["params"], f"{r['reduction']:.3f}", f"{r['jitter_px']:.3f}", f"{r['hf_reduction']:.3f}",
                         f"{r['latency_ms']:.0f}", f"{r['reflection']:.3f}", r["eligible"], r["pass"]])
 
     def fmt(r):
         p = ", ".join(f"{k}={v}" for k, v in r["params"].items()) or "-"
         mark = "✅" if r["pass"] else ("⚠️ 떨림 감소 부족" if r["eligible"] else "❌")
-        return (f"| {r['filter']} | {p} | {r['reduction']:.0%} | {r['jitter_px']:.2f} | "
+        return (f"| {r['filter']} | {p} | {r['reduction']:.0%} | {r['jitter_px']:.2f} | {r['hf_reduction']:.0%} | "
                 f"{r['latency_ms']:.0f} | {r['reflection']:.0%} | {mark} |")
 
     lines = [f"# 필터 비교 결과", "",
              f"입력: still `{args.still}`, move `{args.move}`, fine `{args.fine}`", "",
              f"- 원본 정지 떨림 {raw_jit * px:.2f}px"
-             + (f" ({raw_jit * args.mm_per_unit:.2f}mm)" if args.mm_per_unit else " (mm 배율 미정)"),
+             + (f" ({raw_jit * args.mm_per_unit:.2f}mm)" if args.mm_per_unit else " (mm 배율 미정)")
+             + f", 빠른 떨림(≈2Hz 이상) {raw_hf * px:.3f}px",
              f"- 미세 이동 비교 {len(raw_steps)}번, 원본 이동량 평균 "
              f"{np.mean(raw_steps) * px if raw_steps else float('nan'):.1f}px",
              f"- 조건: 지연 ≤ {LAT_MAX_MS:.0f}ms, 반영률 ≥ {REFLECT_MIN:.0%} 중 떨림 감소 최대 (목표 {STILL_MIN:.0%} 이상)", "",
              "## 필터별 최적값", "",
-             "| 필터 | 파라미터 | 떨림 감소 | 떨림(px) | 지연(ms) | 5mm 반영 | 판정 |", "|---|---|---|---|---|---|---|"]
+             "| 필터 | 파라미터 | 떨림 감소 | 떨림(px) | 빠른 떨림 감소 | 지연(ms) | 5mm 반영 | 판정 |",
+             "|---|---|---|---|---|---|---|---|"]
     best = {}
     for name in GRID:
         cand = [r for r in rows if r["filter"] == name and r["eligible"]]
@@ -240,7 +268,7 @@ def main():
             best[name] = max(cand, key=lambda r: r["reduction"])
             lines.append(fmt(best[name]))
         else:
-            lines.append(f"| {name} | (조건을 만족하는 조합 없음) | | | | | ❌ |")
+            lines.append(f"| {name} | (조건을 만족하는 조합 없음) | | | | | | ❌ |")
     chosen = max(best.values(), key=lambda r: r["reduction"]) if best else None
     lines += ["", f"**선정:** {chosen['filter']} {chosen['params']}" if chosen else "**선정:** 조건을 만족하는 조합 없음"]
     # 최적값이 탐색 범위 끝에 걸리면 범위 밖에 더 좋은 값이 있을 수 있다

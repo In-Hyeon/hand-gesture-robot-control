@@ -3,6 +3,7 @@
     python tools/capture.py                     # 화면으로 확인 (필터 비교 화면)
     python tools/capture.py --filter oneeuro    # 시작 필터 지정
     python tools/capture.py --record still.csv  # 녹화 (정지, 이동, 5mm 미세 이동 구간별로 따로)
+    python tools/capture.py --record data/fine5.csv --secs 33 --guide fine   # 화면 안내에 맞춰 5mm 왕복 녹화
     python tools/capture.py --cam 0 --no-view   # 창 없이 FPS만
 
 화면 (거울처럼 좌우 반전해서 보여 준다. 좌표·녹화는 반전하지 않은 원본 기준)
@@ -45,7 +46,28 @@ ap.add_argument("--record", type=Path)
 ap.add_argument("--no-view", action="store_true")
 ap.add_argument("--filter", default="oneeuro", choices=list(FILTER_KEYS.values()))
 ap.add_argument("--secs", type=float, default=0, help="이 시간(초)이 지나면 자동 종료. 0이면 q나 Ctrl+C로 종료")
+ap.add_argument("--guide", choices=["still", "move", "fine"],
+                help="녹화용 동작 안내를 화면에 띄운다. fine: 5mm 왕복 박자 (1초 이동, 1.5초 멈춤)")
 args = ap.parse_args()
+
+
+def guide_text(mode, t):
+    """녹화 동작 안내 문구와 색. 처음 3초는 자리 잡기 (compare_filters가 정지 녹화의 처음 3초를 뺀다)."""
+    if t < 3:
+        return f"READY  {3 - t:.0f}", (0, 200, 255)
+    if mode == "still":
+        return "HOLD STILL", (0, 255, 0)
+    if mode == "move":
+        return "MOVE naturally: left/right, up/down", (0, 255, 0)
+    # fine: 5초 주기. 화면이 거울 반전이라 화면의 오른쪽 = 내 오른쪽
+    p = (t - 3) % 5.0
+    if p < 1.0:
+        return "MOVE RIGHT 5mm  -->", (0, 200, 255)
+    if p < 2.5:
+        return "HOLD", (0, 255, 0)
+    if p < 3.5:
+        return "<--  MOVE LEFT 5mm", (0, 200, 255)
+    return "HOLD", (0, 255, 0)
 
 # 필터별 파라미터 (키로 조절). 기본값은 filters.py / ros_node와 같다
 params = {"none": {}, "ma": {"window": 5}, "deadzone": {"radius": 0.003},
@@ -188,6 +210,14 @@ try:
             y = 24 + i * 24
             cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
             cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
+        if args.guide:
+            text, color = guide_text(args.guide, t)
+            if args.secs:
+                text += f"   ({args.secs - t:.0f}s)"
+            (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+            org = (max(10, (w - tw) // 2), h // 2)
+            cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 6, cv2.LINE_AA)
+            cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
         cv2.imshow("hand", frame)
 
         key = cv2.waitKey(1) & 0xFF

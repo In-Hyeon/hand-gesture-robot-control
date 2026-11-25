@@ -45,10 +45,13 @@ def select_hand(hands: list[Hand], prev: Hand | None) -> Hand | None:
 
 
 class HandTracker:
-    def __init__(self, num_hands: int = 2, min_confidence: float = 0.5):
+    def __init__(self, num_hands: int = 2, min_confidence: float = 0.5, video_mode: bool = True):
+        """video_mode=False면 IMAGE 모드: 프레임마다 독립적으로 검출한다(프레임 간 추적·보정 없음).
+        MediaPipe가 VIDEO 모드에서 좌표를 얼마나 다듬는지 비교할 때만 쓴다(tools/mp_smoothing_check.py)."""
+        self.video_mode = video_mode
         opts = vision.HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=str(MODEL)),
-            running_mode=vision.RunningMode.VIDEO,
+            running_mode=vision.RunningMode.VIDEO if video_mode else vision.RunningMode.IMAGE,
             num_hands=num_hands,
             min_hand_detection_confidence=min_confidence,
             min_hand_presence_confidence=min_confidence,
@@ -68,7 +71,7 @@ class HandTracker:
         self._last_ms = t_ms
         h, w = bgr.shape[:2]
         img = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-        res = self._lm.detect_for_video(img, t_ms)
+        res = self._lm.detect_for_video(img, t_ms) if self.video_mode else self._lm.detect(img)
 
         hands = []
         for lms, cats in zip(res.hand_landmarks, res.handedness):
