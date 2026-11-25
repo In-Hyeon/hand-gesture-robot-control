@@ -27,7 +27,7 @@ mkdir -p "$REPO/models"
 [ -f "$REPO/models/hand_landmarker.task" ] || curl -L -o "$REPO/models/hand_landmarker.task" \
   https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
 
-source /opt/ros/jazzy/setup.bash
+set +u; source /opt/ros/jazzy/setup.bash; set -u
 echo "ROS_DISTRO=$ROS_DISTRO"
 "$REPO/.venv-ros/bin/python" -c "import rclpy, mediapipe; print('rclpy + mediapipe OK')"
 ros2 pkg list | grep -c . | xargs echo "packages:"
