@@ -1,0 +1,133 @@
+"""인식 노드: 웹캠 → HandTracker → /hand/state (hand_teleop_msgs/HandState).
+
+rclpy는 이 파일에서만 import한다. 손 좌표 로직은 tracker.py(순수 Python)에 있다.
+
+    source /opt/ros/jazzy/setup.bash && source install/setup.bash
+    .venv-ros/bin/python -m hand_teleop.ros_node
+    .venv-ros/bin/python -m hand_teleop.ros_node --ros-args -p mode_when_tracking:=move
+
+최소 버전(v0): 제스처 판별이 아직 없어서 mode·gripper는 임시값이다.
+- mode: 손이 보이고 confidence >= min_confidence면 `mode_when_tracking` 값, 아니면 IDLE.
+  기본값 idle. 제어부 연동 시험에는 move로 켜면 "손 따라 움직임"을 확인할 수 있다.
+- gripper: 항상 OPEN.
+- 필터 없음(x, y = 원본 기준점). 필터 교체는 다음 단계에서 붙인다.
+"""
+import sys
+import time
+
+import cv2
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+
+from hand_teleop_msgs.msg import HandState
+from hand_teleop.tracker import HandTracker
+
+MODES = {"idle": HandState.MODE_IDLE, "move": HandState.MODE_MOVE,
+         "height": HandState.MODE_HEIGHT, "hold": HandState.MODE_HOLD}
+
+
+class HandStateNode(Node):
+    def __init__(self):
+        super().__init__("hand_state_node")
+        p = self.declare_parameter
+        self.cam = p("cam", 0).value
+        self.width = p("width", 640).value
+        self.height = p("height", 480).value
+        self.fps_req = p("fps", 30).value
+        self.min_conf = p("min_confidence", 0.5).value
+        mode_name = p("mode_when_tracking", "idle").value
+        if mode_name not in MODES:
+            raise ValueError(f"mode_when_tracking must be one of {list(MODES)}, got {mode_name!r}")
+        self.mode_tracking = MODES[mode_name]
+
+        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=1)
+        self.pub = self.create_publisher(HandState, "/hand/state", qos)
+
+        self.cap = cv2.VideoCapture(self.cam, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.cap.set(cv2.CAP_PROP_FPS, self.fps_req)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"camera {self.cam} not opened")
+        self.tracker = HandTracker(min_confidence=self.min_conf)
+
+        self.last_x = self.last_y = 0.0  # 손이 없을 때 유지할 마지막 값
+        self.t0 = time.perf_counter()
+        self.n = self.seen = 0
+        self.proc_ms_sum = 0.0
+        self.win_t, self.win_n, self.win_proc = self.t0, 0, 0.0
+        self.get_logger().info(
+            f"cam={self.cam} {self.width}x{self.height}@{self.fps_req}, min_conf={self.min_conf}, "
+            f"mode_when_tracking={mode_name}, filter=none (v0)")
+
+    def step(self) -> bool:
+        ok, frame = self.cap.read()
+        stamp = self.get_clock().now()  # 프레임 획득 직후. 드라이버 버퍼 지연은 240fps 촬영으로 따로 잰다
+        if not ok:
+            return False
+        t_proc = time.perf_counter()
+        hand = self.tracker.process(frame, int((t_proc - self.t0) * 1000))
+
+        msg = HandState()
+        msg.header.stamp = stamp.to_msg()
+        msg.header.frame_id = "camera"
+        msg.gripper = HandState.GRIPPER_OPEN
+        if hand is not None:
+            self.last_x, self.last_y = hand.x, hand.y
+            msg.hand_detected = True
+            msg.handedness = hand.handedness
+            msg.confidence = hand.confidence
+            msg.mode = self.mode_tracking if hand.confidence >= self.min_conf else HandState.MODE_IDLE
+        else:
+            msg.hand_detected = False
+            msg.handedness = HandState.HANDEDNESS_UNKNOWN
+            msg.confidence = 0.0
+            msg.mode = HandState.MODE_IDLE
+        msg.x, msg.y = self.last_x, self.last_y
+        self.pub.publish(msg)
+
+        proc_ms = (time.perf_counter() - t_proc) * 1000
+        self.n += 1
+        self.seen += hand is not None
+        self.proc_ms_sum += proc_ms
+        self.win_n += 1
+        self.win_proc += proc_ms
+        now = time.perf_counter()
+        if now - self.win_t >= 5.0:
+            self.get_logger().info(
+                f"{self.win_n / (now - self.win_t):.1f} FPS, process {self.win_proc / self.win_n:.1f} ms/frame, "
+                f"hand {'yes' if hand else 'no'}")
+            self.win_t, self.win_n, self.win_proc = now, 0, 0.0
+        return True
+
+    def summary(self) -> str:
+        dt = time.perf_counter() - self.t0
+        n = max(self.n, 1)
+        return (f"{self.n} frames in {dt:.1f}s = {self.n / dt:.1f} FPS avg, "
+                f"process {self.proc_ms_sum / n:.1f} ms/frame, hand seen {self.seen}/{self.n}")
+
+    def close(self):
+        self.cap.release()
+        self.tracker.close()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = HandStateNode()
+    try:
+        # 카메라 read()가 프레임 주기를 정하므로 타이머 대신 직접 루프를 돈다. 파라미터 등 콜백은 spin_once로 처리.
+        while rclpy.ok():
+            node.step()
+            rclpy.spin_once(node, timeout_sec=0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print(node.summary(), file=sys.stderr)
+        node.close()
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()
