@@ -16,6 +16,7 @@ from pathlib import Path
 import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from hand_teleop.camera import actual_settings, open_camera  # noqa: E402
 from hand_teleop.tracker import BASE_IDX, LEFT, HandTracker  # noqa: E402
 
 ap = argparse.ArgumentParser()
@@ -25,11 +26,8 @@ ap.add_argument("--no-view", action="store_true")
 ap.add_argument("--secs", type=float, default=0, help="이 시간(초)이 지나면 자동 종료. 0이면 q나 Ctrl+C로 종료")
 args = ap.parse_args()
 
-cap = cv2.VideoCapture(args.cam, cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_V4L2)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-cap.set(cv2.CAP_PROP_FPS, 30)
-assert cap.isOpened(), f"camera {args.cam} not opened"
+cap = open_camera(args.cam)
+print(f"camera {args.cam}: {actual_settings(cap)}")
 
 out = writer = None
 if args.record:
@@ -50,6 +48,7 @@ try:
         if args.secs and t > args.secs:
             break
         if not ok:
+            time.sleep(0.01)  # 카메라가 빠졌을 때 CPU를 쓰며 헛돌지 않게
             continue
         hand = tracker.process(frame, int(t * 1000))
         n += 1

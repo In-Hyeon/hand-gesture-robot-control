@@ -7,20 +7,23 @@ rclpy는 이 파일에서만 import한다. 손 좌표 로직은 tracker.py(순�
     .venv-ros/bin/python -m hand_teleop.ros_node --ros-args -p mode_when_tracking:=move
 
 최소 버전(v0): 제스처 판별이 아직 없어서 mode·gripper는 임시값이다.
-- mode: 손이 보이고 confidence >= min_confidence면 `mode_when_tracking` 값, 아니면 IDLE.
+- mode: 손이 보이면 `mode_when_tracking` 값, 안 보이면 IDLE.
   기본값 idle. 제어부 연동 시험에는 move로 켜면 "손 따라 움직임"을 확인할 수 있다.
+- min_confidence: MediaPipe의 손 검출·존재·추적 임계값. 이보다 낮은 손은 MediaPipe가 버려서
+  hand_detected=false(→ IDLE)가 된다. 메시지의 confidence(좌우 판별 점수)는 항상 0.5 이상이라
+  그 값과 비교하는 방식으로는 일시정지가 걸리지 않는다.
 - gripper: 항상 OPEN.
 - 필터 없음(x, y = 원본 기준점). 필터 교체는 다음 단계에서 붙인다.
 """
 import sys
 import time
 
-import cv2
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from hand_teleop_msgs.msg import HandState
+from hand_teleop.camera import actual_settings, open_camera
 from hand_teleop.tracker import HandTracker
 
 MODES = {"idle": HandState.MODE_IDLE, "move": HandState.MODE_MOVE,
@@ -44,27 +47,28 @@ class HandStateNode(Node):
         qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=1)
         self.pub = self.create_publisher(HandState, "/hand/state", qos)
 
-        self.cap = cv2.VideoCapture(self.cam, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.fps_req)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"camera {self.cam} not opened")
+        self.cap = open_camera(self.cam, self.width, self.height, self.fps_req)
         self.tracker = HandTracker(min_confidence=self.min_conf)
 
         self.last_x = self.last_y = 0.0  # 손이 없을 때 유지할 마지막 값
         self.t0 = time.perf_counter()
-        self.n = self.seen = 0
+        self.n = self.seen = self.read_fail = 0
         self.proc_ms_sum = 0.0
         self.win_t, self.win_n, self.win_proc = self.t0, 0, 0.0
         self.get_logger().info(
-            f"cam={self.cam} {self.width}x{self.height}@{self.fps_req}, min_conf={self.min_conf}, "
+            f"cam={self.cam} requested {self.width}x{self.height}@{self.fps_req}, "
+            f"actual {actual_settings(self.cap)}, min_conf={self.min_conf}, "
             f"mode_when_tracking={mode_name}, filter=none (v0)")
 
     def step(self) -> bool:
         ok, frame = self.cap.read()
         stamp = self.get_clock().now()  # 프레임 획득 직후. 드라이버 버퍼 지연은 240fps 촬영으로 따로 잰다
         if not ok:
+            # 발행하지 않는다: 제어부가 0.2초 끊김으로 "인식부 이상"을 감지해야 한다.
+            # 카메라가 빠졌을 때 CPU를 100% 쓰며 헛도는 것을 막으려고 잠깐 쉰다.
+            self.read_fail += 1
+            self.get_logger().warn("camera read failed", throttle_duration_sec=2.0)
+            time.sleep(0.01)
             return False
         t_proc = time.perf_counter()
         hand = self.tracker.process(frame, int((t_proc - self.t0) * 1000))
@@ -78,7 +82,7 @@ class HandStateNode(Node):
             msg.hand_detected = True
             msg.handedness = hand.handedness
             msg.confidence = hand.confidence
-            msg.mode = self.mode_tracking if hand.confidence >= self.min_conf else HandState.MODE_IDLE
+            msg.mode = self.mode_tracking
         else:
             msg.hand_detected = False
             msg.handedness = HandState.HANDEDNESS_UNKNOWN
@@ -105,7 +109,8 @@ class HandStateNode(Node):
         dt = time.perf_counter() - self.t0
         n = max(self.n, 1)
         return (f"{self.n} frames in {dt:.1f}s = {self.n / dt:.1f} FPS avg, "
-                f"process {self.proc_ms_sum / n:.1f} ms/frame, hand seen {self.seen}/{self.n}")
+                f"process {self.proc_ms_sum / n:.1f} ms/frame, hand seen {self.seen}/{self.n}, "
+                f"read failures {self.read_fail}")
 
     def close(self):
         self.cap.release()

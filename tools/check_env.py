@@ -11,15 +11,14 @@ import cv2
 import mediapipe as mp
 from mediapipe.tasks.python import BaseOptions, vision
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from hand_teleop.camera import actual_settings, open_camera  # noqa: E402
+
 cam = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 secs = float(sys.argv[2]) if len(sys.argv) > 2 else 5
 model = Path(__file__).resolve().parent.parent / "models" / "hand_landmarker.task"
 
-cap = cv2.VideoCapture(cam, cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_V4L2)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-cap.set(cv2.CAP_PROP_FPS, 30)
-assert cap.isOpened(), f"camera {cam} not opened"
+cap = open_camera(cam)
 
 opts = vision.HandLandmarkerOptions(
     base_options=BaseOptions(model_asset_path=str(model)),
@@ -33,6 +32,7 @@ with vision.HandLandmarker.create_from_options(opts) as lm:
     while time.perf_counter() - t0 < secs:
         ok, bgr = cap.read()
         if not ok:
+            time.sleep(0.01)
             continue
         img = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         t1 = time.perf_counter()
@@ -41,7 +41,10 @@ with vision.HandLandmarker.create_from_options(opts) as lm:
         frames += 1
         hands += bool(res.hand_landmarks)
     dt = time.perf_counter() - t0
+settings = actual_settings(cap)
 cap.release()
 
-print(f"camera {cam}: {bgr.shape[1]}x{bgr.shape[0]}, {frames / dt:.1f} FPS, "
+if frames == 0:
+    sys.exit(f"camera {cam}: opened but no frame read in {secs:.0f}s")
+print(f"camera {cam}: {settings}, {frames / dt:.1f} FPS, "
       f"MediaPipe {mp_ms / max(frames, 1):.1f} ms/frame, hand seen in {hands}/{frames} frames")
