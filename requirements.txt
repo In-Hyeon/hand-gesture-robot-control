@@ -1,0 +1,4 @@
+mediapipe==1.2.3
+opencv-contrib-python==4.11.0.86
+numpy==1.26.4
+matplotlib==3.8.4  # tools/compare_filters.py 그래프 (numpy<2와 호환)
