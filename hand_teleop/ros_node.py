@@ -7,8 +7,13 @@ rclpy는 이 파일에서만 import한다. 손 좌표 로직은 tracker.py(순�
     .venv-ros/bin/python -m hand_teleop.ros_node --ros-args -p mode_when_tracking:=move
 
 최소 버전(v0): 제스처 판별이 아직 없어서 mode·gripper는 임시값이다.
-- mode: 손이 보이면 `mode_when_tracking` 값, 안 보이면 IDLE.
+- mode: 무장(armed) 상태이고 손이 보이면 `mode_when_tracking` 값, 아니면 IDLE.
   기본값 idle. 제어부 연동 시험에는 move로 켜면 "손 따라 움직임"을 확인할 수 있다.
+- 재개 보호 (clutch.py ResumeGuard): 시작할 때, 그리고 손을 놓치거나 위치가 튀면 무장이 풀린다.
+  손이 다시 보여도 IDLE이고, 손이 보이는 상태에서 활성화해야 다시 조작 모드가 나간다(안전 규칙 "재개는 활성화 제스처로만").
+  활성화 제스처가 붙기 전까지는 서비스로 활성화한다:
+    ros2 service call /hand/activate std_srvs/srv/Trigger
+  시뮬레이션 연동 시험에서 매번 부르기 번거로우면 -p auto_resume:=true (손이 다시 보이면 바로 재개, 실물에서는 쓰지 않는다).
 - min_confidence: MediaPipe의 손 검출·존재·추적 임계값. 이보다 낮은 손은 MediaPipe가 버려서
   hand_detected=false(→ IDLE)가 된다. 메시지의 confidence(좌우 판별 점수)는 항상 0.5 이상이라
   그 값과 비교하는 방식으로는 일시정지가 걸리지 않는다.
@@ -30,9 +35,11 @@ import rclpy
 from geometry_msgs.msg import PointStamped
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_srvs.srv import Trigger
 
 from hand_teleop_msgs.msg import HandState
 from hand_teleop.camera import actual_settings, open_camera
+from hand_teleop.clutch import ResumeGuard
 from hand_teleop.filters import make_filter
 from hand_teleop.tracker import HandTracker
 
@@ -65,7 +72,11 @@ class HandStateNode(Node):
         self.filter = make_filter(filter_name, **filter_params)
         # 30fps에서 0.1/프레임 = 초당 영상 너비 3배. 정상적인 손 이동보다 훨씬 빠르다
         self.max_jump = p("max_jump", 0.1).value
-        self.raw_prev: tuple[float, float] | None = None  # 직전 프레임 원본 기준점 (튐 판정용)
+        self.raw_prev: tuple[float, float] | None = None  # 직전 프레임 원본 기준점 (튐 판정용, 손이 없으면 None)
+
+        self.auto_resume = p("auto_resume", False).value
+        self.guard = ResumeGuard(auto_resume=self.auto_resume)
+        self.create_service(Trigger, "/hand/activate", self.on_activate)
 
         qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=1)
         self.pub = self.create_publisher(HandState, "/hand/state", qos)
@@ -82,7 +93,18 @@ class HandStateNode(Node):
         self.get_logger().info(
             f"cam={self.cam} requested {self.width}x{self.height}@{self.fps_req}, "
             f"actual {actual_settings(self.cap)}, min_conf={self.min_conf}, "
-            f"mode_when_tracking={mode_name}, filter={filter_name} {filter_params}, max_jump={self.max_jump}")
+            f"mode_when_tracking={mode_name}, auto_resume={self.auto_resume}, "
+            f"filter={filter_name} {filter_params}, max_jump={self.max_jump}")
+        if not self.auto_resume:
+            self.get_logger().info("not armed: show your hand, then call /hand/activate")
+
+    def on_activate(self, request, response):
+        """/hand/activate (std_srvs/Trigger). 손이 보일 때만 무장. 다음 프레임부터 조작 모드가 나간다."""
+        hand_present = self.raw_prev is not None
+        response.success = self.guard.arm(hand_present)
+        response.message = "armed" if response.success else "no hand: show your hand first"
+        self.get_logger().info(f"/hand/activate: {response.message}")
+        return response
 
     def step(self) -> bool:
         ok, frame = self.cap.read()
@@ -101,6 +123,7 @@ class HandStateNode(Node):
         msg.header.stamp = stamp.to_msg()
         msg.header.frame_id = "camera"
         msg.gripper = HandState.GRIPPER_OPEN
+        was_armed = self.guard.armed
         if hand is not None:
             jumped = (self.raw_prev is not None
                       and math.hypot(hand.x - self.raw_prev[0], hand.y - self.raw_prev[1]) > self.max_jump)
@@ -113,7 +136,7 @@ class HandStateNode(Node):
             msg.hand_detected = True
             msg.handedness = hand.handedness
             msg.confidence = hand.confidence
-            msg.mode = HandState.MODE_IDLE if jumped else self.mode_tracking
+            msg.mode = self.mode_tracking if self.guard.update(True, jumped) else HandState.MODE_IDLE
             raw = PointStamped()
             raw.header = msg.header
             raw.point.x, raw.point.y = hand.x, hand.y
@@ -126,6 +149,10 @@ class HandStateNode(Node):
             msg.handedness = HandState.HANDEDNESS_UNKNOWN
             msg.confidence = 0.0
             msg.mode = HandState.MODE_IDLE
+            self.guard.update(False, False)
+        if was_armed and not self.guard.armed:
+            self.get_logger().info(f"disarmed ({'jump' if hand is not None else 'hand lost'}): "
+                                   "call /hand/activate to resume")
         msg.x, msg.y = self.last_x, self.last_y
         self.pub.publish(msg)
 

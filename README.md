@@ -24,6 +24,7 @@ hand_teleop/             인식부 Python 코드
   tracker.py               손 좌표 모듈 (ROS 없는 순수 Python)
   filters.py               떨림 필터: 이동평균, 데드존, One Euro (같은 입력에 바꿔 끼우는 구조)
   camera.py                웹캠 열기 (노드와 도구가 같은 설정 사용)
+  clutch.py                재개 보호: 손 소실·튐 뒤에는 활성화 전까지 조작 모드를 내지 않음
   ros_node.py              인식 노드: 웹캠 → tracker → 필터 → /hand/state 발행
 tools/
   check_env.py             웹캠 + MediaPipe 동작과 FPS 점검
@@ -65,6 +66,10 @@ models/                  MediaPipe 모델 (설치 스크립트가 받음, git �
 - 손을 놓치면 필터를 초기화한다. 한 프레임에 `max_jump`보다 멀리 튀면 다른 손으로 넘어간 것으로 보고 그 프레임을 `IDLE`로 낸다(제어부가 기준점을 새로 잡아 로봇이 튀지 않음).
 - 파라미터 기본값은 임시값이다. 녹화 데이터로 비교한 뒤 정한다.
 
+**재개 보호 (`hand_teleop/clutch.py`)**
+- 노드는 시작할 때, 그리고 손을 놓치거나 위치가 튀면 "해제" 상태가 된다. 해제 상태에서는 손이 다시 보여도 `IDLE`이다(안전 규칙 "재개는 활성화 제스처로만").
+- 손이 보일 때 활성화해야 다시 조작 모드가 나간다. 활성화 제스처가 붙기 전까지는 `/hand/activate` 서비스(`std_srvs/srv/Trigger`)를 쓴다.
+
 ## 설치와 실행 (Ubuntu 24.04)
 ```bash
 # 1. ROS 2 Jazzy, rosbag2, .venv-ros(rclpy + MediaPipe), 모델 설치
@@ -77,8 +82,11 @@ source install/setup.bash
 
 # 3. 인식 노드 실행 (Ctrl+C로 종료하면 평균 FPS 출력)
 .venv-ros/bin/python -m hand_teleop.ros_node
-# 제어부 연동 시험용: 손이 보이면 mode=MOVE로 발행 (제스처 판별이 붙기 전 임시 기능)
+# 제어부 연동 시험용: 활성화 후 손이 보이면 mode=MOVE로 발행 (제스처 판별이 붙기 전 임시 기능)
 .venv-ros/bin/python -m hand_teleop.ros_node --ros-args -p mode_when_tracking:=move
+ros2 service call /hand/activate std_srvs/srv/Trigger   # 손을 보인 상태에서 활성화 (손을 놓치면 다시 호출)
+# 시뮬레이션에서 매번 활성화하기 번거로우면 (실물에서는 쓰지 않음)
+.venv-ros/bin/python -m hand_teleop.ros_node --ros-args -p mode_when_tracking:=move -p auto_resume:=true
 
 # 4. 다른 터미널에서 확인
 ros2 topic echo /hand/state
@@ -89,7 +97,8 @@ ros2 topic echo /hand/state
 |---|---|---|
 | `cam`, `width`, `height`, `fps` | 0, 640, 480, 30 | 웹캠 번호와 요청 해상도·FPS (실제 적용값은 시작 로그에 출력) |
 | `min_confidence` | 0.5 | MediaPipe 손 검출·존재·추적 임계값. 이보다 낮으면 손 없음(`IDLE`) |
-| `mode_when_tracking` | idle | 손이 보일 때 낼 mode (idle / move / height / hold). 제스처 판별 전 임시 |
+| `mode_when_tracking` | idle | 활성화 상태에서 손이 보일 때 낼 mode (idle / move / height / hold). 제스처 판별 전 임시 |
+| `auto_resume` | false | true면 손 소실·튐 뒤 손이 다시 보이면 바로 재개 (시뮬레이션 시험용, 실물 금지) |
 | `filter` | none | none / ma / deadzone / oneeuro. 녹화는 none(원본 좌표)으로 한다 |
 | `ma_window` | 5 | 이동평균 프레임 수 |
 | `deadzone_radius` | 0.003 | 데드존 반경 (정규화 단위) |
@@ -106,6 +115,7 @@ ROS 없이 확인할 때:
 .venv-ros/bin/python tools/capture.py            # 필터 비교 화면: 원본(빨강)과 필터 출력(초록), 1~4로 필터 전환 (q 종료)
 .venv-ros/bin/python -m hand_teleop.tracker      # tracker 자체 점검 (카메라 불필요)
 .venv-ros/bin/python -m hand_teleop.filters      # 필터 자체 점검: 같은 가상 입력에 필터 4개 적용 (카메라 불필요)
+.venv-ros/bin/python -m hand_teleop.clutch       # 재개 보호 자체 점검 (카메라 불필요)
 ```
 
 ## 필터 비교 (녹화 → 오프라인 비교)
